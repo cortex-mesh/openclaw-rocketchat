@@ -3,7 +3,10 @@
  * Polls channel history and active threads, dispatches new messages to the agent system.
  */
 
-import { getChannelInfo, getChannelHistory, getThreadMessages, sendMessage } from './api.js';
+import { getChannelInfo, getChannelHistory, getThreadMessages, sendMessage, downloadFile, reactToMessage } from './api.js';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { markProcessing, markComplete, markFailed } from './reactions.js';
 import { getRuntime } from './runtime.js';
 
@@ -74,8 +77,19 @@ async function processMessage(config, msg, roomId, replyThreadId, { account, cfg
   const senderUsername = msg.u?.username || 'unknown';
   const text = msg.msg || '';
 
+  // Clear stale ❌ from a previous failed attempt (only if present —
+  // Rocket.Chat's chat.react toggles, so removing a non-existent reaction adds it)
+  if (msg.reactions?.[':x:']) {
+    try {
+      await reactToMessage(config, msg._id, 'x', false);
+    } catch (err) {
+      log?.warn?.(`Failed to remove stale x from ${msg._id}: ${err.message}`);
+    }
+  }
+
   await markProcessing(config, msg._id, log);
 
+  let tempDir = null;
   try {
     const pluginRuntime = getRuntime();
     const accountId = account.accountId || 'default';
@@ -122,6 +136,36 @@ async function processMessage(config, msg, roomId, replyThreadId, { account, cfg
       ctx.MessageThreadId = replyThreadId;
     }
 
+    // Download file attachments to temp dir for media context
+    if (msg.file && msg.attachments?.length) {
+      try {
+        tempDir = await mkdtemp(join(tmpdir(), 'rc-attach-'));
+        const paths = [];
+        const types = [];
+        for (const att of msg.attachments) {
+          if (att.type !== 'file' || !att.title_link) continue;
+          const filename = att.title || msg.file.name || 'attachment';
+          const destPath = join(tempDir, filename);
+          try {
+            await downloadFile(config, att.title_link, destPath);
+            paths.push(destPath);
+            types.push(msg.file.type || att.image_type || 'application/octet-stream');
+          } catch (dlErr) {
+            log?.warn?.(`Attachment download failed for ${att.title_link}: ${dlErr.message}`);
+          }
+        }
+        if (paths.length === 1) {
+          ctx.MediaPath = paths[0];
+          ctx.MediaType = types[0];
+        } else if (paths.length > 1) {
+          ctx.MediaPaths = paths;
+          ctx.MediaTypes = types;
+        }
+      } catch (err) {
+        log?.warn?.(`Attachment processing failed for ${msg._id}: ${err.message}`);
+      }
+    }
+
     let delivered = false;
     let deliveryError = null;
 
@@ -156,6 +200,10 @@ async function processMessage(config, msg, roomId, replyThreadId, { account, cfg
   } catch (err) {
     await markFailed(config, msg._id, log);
     log?.error?.(`Dispatch error for message ${msg._id}: ${err.message}`);
+  } finally {
+    if (tempDir) {
+      rm(tempDir, { recursive: true, force: true }).catch(() => {});
+    }
   }
 
   return true;
