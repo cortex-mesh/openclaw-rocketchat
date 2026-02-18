@@ -4,6 +4,7 @@ import { rocketchatPlugin } from '../src/channel.js';
 // Mock dependencies
 vi.mock('../src/api.js', () => ({
   sendMessage: vi.fn().mockResolvedValue({}),
+  getChannelInfo: vi.fn().mockResolvedValue({ channel: { _id: 'room-1' } }),
   probe: vi.fn().mockResolvedValue({ ok: true, username: 'bot', userId: 'u1' }),
 }));
 
@@ -11,7 +12,7 @@ vi.mock('../src/monitor.js', () => ({
   monitorRocketChat: vi.fn(),
 }));
 
-import { sendMessage, probe } from '../src/api.js';
+import { sendMessage, getChannelInfo, probe } from '../src/api.js';
 import { monitorRocketChat } from '../src/monitor.js';
 
 beforeEach(() => {
@@ -36,7 +37,7 @@ describe('channel plugin', () => {
   });
 
   describe('config', () => {
-    it('lists single account from shorthand config', () => {
+    it('lists single account id from shorthand config', () => {
       const cfg = {
         channels: {
           rocketchat: {
@@ -48,14 +49,12 @@ describe('channel plugin', () => {
         },
       };
 
-      const accounts = rocketchatPlugin.config.listAccounts(cfg);
+      const ids = rocketchatPlugin.config.listAccountIds(cfg);
 
-      expect(accounts).toHaveLength(1);
-      expect(accounts[0].accountId).toBe('default');
-      expect(accounts[0].url).toBe('https://chat.example.com');
+      expect(ids).toEqual(['default']);
     });
 
-    it('lists multiple accounts', () => {
+    it('lists multiple account ids', () => {
       const cfg = {
         channels: {
           rocketchat: {
@@ -67,15 +66,33 @@ describe('channel plugin', () => {
         },
       };
 
-      const accounts = rocketchatPlugin.config.listAccounts(cfg);
+      const ids = rocketchatPlugin.config.listAccountIds(cfg);
 
-      expect(accounts).toHaveLength(2);
-      expect(accounts.map((a) => a.accountId)).toEqual(['work', 'home']);
+      expect(ids).toEqual(['work', 'home']);
     });
 
     it('returns empty array when no config', () => {
-      expect(rocketchatPlugin.config.listAccounts({})).toEqual([]);
-      expect(rocketchatPlugin.config.listAccounts({ channels: {} })).toEqual([]);
+      expect(rocketchatPlugin.config.listAccountIds({})).toEqual([]);
+      expect(rocketchatPlugin.config.listAccountIds({ channels: {} })).toEqual([]);
+    });
+
+    it('isConfigured checks required fields', () => {
+      expect(rocketchatPlugin.config.isConfigured({ url: 'x', authToken: 'y', userId: 'z' })).toBe(true);
+      expect(rocketchatPlugin.config.isConfigured({ url: 'x' })).toBe(false);
+      expect(rocketchatPlugin.config.isConfigured(null)).toBe(false);
+    });
+
+    it('describeAccount returns account summary', () => {
+      const desc = rocketchatPlugin.config.describeAccount({
+        accountId: 'default',
+        url: 'x',
+        authToken: 'y',
+        userId: 'z',
+        channel: 'general',
+      });
+      expect(desc.accountId).toBe('default');
+      expect(desc.name).toBe('general');
+      expect(desc.configured).toBe(true);
     });
 
     it('resolves account by id', () => {
@@ -116,9 +133,13 @@ describe('channel plugin', () => {
 
       await rocketchatPlugin.outbound.sendText(ctx);
 
+      expect(getChannelInfo).toHaveBeenCalledWith(
+        { url: 'https://chat.example.com', authToken: 'token', userId: 'user-1' },
+        'general',
+      );
       expect(sendMessage).toHaveBeenCalledWith(
         { url: 'https://chat.example.com', authToken: 'token', userId: 'user-1' },
-        { channel: 'general', text: 'hello world', threadId: 'thread-1' },
+        { roomId: 'room-1', text: 'hello world', threadId: 'thread-1' },
       );
     });
 
@@ -142,7 +163,6 @@ describe('channel plugin', () => {
           },
         },
         accountId: 'default',
-        runtime: {},
         abortSignal: new AbortController().signal,
         log: { info: vi.fn(), error: vi.fn() },
       };
@@ -152,7 +172,6 @@ describe('channel plugin', () => {
       expect(monitorRocketChat).toHaveBeenCalledWith(
         expect.objectContaining({
           account: expect.objectContaining({ url: 'https://chat.example.com' }),
-          runtime: ctx.runtime,
           abortSignal: ctx.abortSignal,
           log: ctx.log,
         }),

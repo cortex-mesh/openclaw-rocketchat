@@ -9,6 +9,24 @@ vi.mock('../src/api.js', () => ({
   reactToMessage: vi.fn().mockResolvedValue({}),
 }));
 
+// Mock runtime module — getRuntime returns the pluginRuntime
+const mockDispatch = vi.fn().mockResolvedValue({});
+const mockResolveAgentRoute = vi.fn().mockReturnValue({ sessionKey: 'session-1' });
+
+vi.mock('../src/runtime.js', () => ({
+  getRuntime: vi.fn(() => ({
+    channel: {
+      routing: {
+        resolveAgentRoute: mockResolveAgentRoute,
+      },
+      reply: {
+        dispatchReplyWithBufferedBlockDispatcher: mockDispatch,
+      },
+    },
+  })),
+  setRuntime: vi.fn(),
+}));
+
 import { getChannelInfo, getChannelHistory, sendMessage, reactToMessage } from '../src/api.js';
 
 function makeMsg(id, userId = 'sender-1', username = 'alice', text = 'hello', extra = {}) {
@@ -23,24 +41,6 @@ function makeAccount(overrides = {}) {
     channel: 'general',
     pollInterval: 0.01, // 10ms for fast tests
     ...overrides,
-  };
-}
-
-function makeRuntime() {
-  return {
-    channel: {
-      routing: {
-        resolveAgentRoute: vi.fn().mockReturnValue({ sessionKey: 'session-1' }),
-      },
-      dispatchInboundMessage: vi.fn().mockImplementation(async ({ dispatcher }) => {
-        // Simulate agent calling deliver
-        await dispatcher.deliver({ text: 'response' });
-      }),
-      createReplyDispatcher: vi.fn().mockImplementation(({ deliver, onError }) => ({
-        deliver,
-        onError,
-      })),
-    },
   };
 }
 
@@ -61,16 +61,13 @@ afterEach(() => {
 });
 
 // Helper: run monitor for a limited number of poll cycles.
-// Aborts on the poll AFTER the last desired one, so messages from the
-// last desired poll are fully processed before shutdown.
-async function runMonitor(account, runtime, opts = {}) {
+async function runMonitor(account, opts = {}) {
   const pollCount = opts.pollCount || 1;
   let pollsDone = 0;
 
   getChannelHistory.mockImplementation(async () => {
     pollsDone++;
     if (pollsDone > pollCount) {
-      // Abort on the extra poll — previous poll's messages already processed
       controller.abort();
       return { messages: [] };
     }
@@ -80,7 +77,6 @@ async function runMonitor(account, runtime, opts = {}) {
   await monitorRocketChat({
     account: makeAccount(account),
     cfg: {},
-    runtime: runtime || makeRuntime(),
     abortSignal: controller.signal,
     log,
   });
@@ -88,37 +84,56 @@ async function runMonitor(account, runtime, opts = {}) {
 
 describe('monitor', () => {
   it('skips own messages', async () => {
-    const runtime = makeRuntime();
-
-    await runMonitor({}, runtime, {
+    await runMonitor({}, {
       historyResponse: { messages: [makeMsg('msg-1', 'bot-user', 'bot', 'self msg')] },
     });
 
-    expect(runtime.channel.dispatchInboundMessage).not.toHaveBeenCalled();
+    expect(mockDispatch).not.toHaveBeenCalled();
   });
 
   it('skips system messages', async () => {
-    const runtime = makeRuntime();
-
-    await runMonitor({}, runtime, {
+    await runMonitor({}, {
       historyResponse: { messages: [{ ...makeMsg('msg-1'), t: 'uj' }] },
     });
 
-    expect(runtime.channel.dispatchInboundMessage).not.toHaveBeenCalled();
+    expect(mockDispatch).not.toHaveBeenCalled();
   });
 
   it('skips bot messages', async () => {
-    const runtime = makeRuntime();
-
-    await runMonitor({}, runtime, {
+    await runMonitor({}, {
       historyResponse: { messages: [{ ...makeMsg('msg-1'), bot: true }] },
     });
 
-    expect(runtime.channel.dispatchInboundMessage).not.toHaveBeenCalled();
+    expect(mockDispatch).not.toHaveBeenCalled();
+  });
+
+  it('skips messages already marked with checkmark', async () => {
+    const completedMsg = {
+      ...makeMsg('msg-1'),
+      reactions: { ':white_check_mark:': { usernames: ['forgeclaw'] } },
+    };
+
+    await runMonitor({}, {
+      historyResponse: { messages: [completedMsg] },
+    });
+
+    expect(mockDispatch).not.toHaveBeenCalled();
+  });
+
+  it('processes messages with x reaction (failed, needs retry)', async () => {
+    const failedMsg = {
+      ...makeMsg('msg-1'),
+      reactions: { ':x:': { usernames: ['forgeclaw'] } },
+    };
+
+    await runMonitor({}, {
+      historyResponse: { messages: [failedMsg] },
+    });
+
+    expect(mockDispatch).toHaveBeenCalledTimes(1);
   });
 
   it('skips already-processed messages', async () => {
-    const runtime = makeRuntime();
     const msg = makeMsg('msg-1');
     let pollCount = 0;
 
@@ -131,19 +146,16 @@ describe('monitor', () => {
     await monitorRocketChat({
       account: makeAccount(),
       cfg: {},
-      runtime,
       abortSignal: controller.signal,
       log,
     });
 
     // Only dispatched once despite two polls
-    expect(runtime.channel.dispatchInboundMessage).toHaveBeenCalledTimes(1);
+    expect(mockDispatch).toHaveBeenCalledTimes(1);
   });
 
   it('processes new user messages', async () => {
-    const runtime = makeRuntime();
-
-    await runMonitor({}, runtime, {
+    await runMonitor({}, {
       historyResponse: { messages: [makeMsg('msg-1', 'sender-1', 'alice', 'hello')] },
     });
 
@@ -156,75 +168,77 @@ describe('monitor', () => {
     );
 
     // Message dispatched
-    expect(runtime.channel.dispatchInboundMessage).toHaveBeenCalledTimes(1);
+    expect(mockDispatch).toHaveBeenCalledTimes(1);
+    expect(mockDispatch).toHaveBeenCalledWith(
+      expect.objectContaining({
+        ctx: expect.objectContaining({
+          Body: 'hello',
+          SessionKey: 'session-1',
+          Provider: 'rocketchat',
+          SenderId: 'sender-1',
+          SenderUsername: 'alice',
+        }),
+      }),
+    );
   });
 
-  it('thread messages include threadId', async () => {
-    const runtime = makeRuntime();
+  it('thread messages include threadId in deliver callback', async () => {
     const threadMsg = makeMsg('msg-1', 'sender-1', 'alice', 'reply', { tmid: 'parent-1' });
 
-    await runMonitor({}, runtime, {
+    // Make dispatch call the deliver callback
+    mockDispatch.mockImplementationOnce(async ({ dispatcherOptions }) => {
+      await dispatcherOptions.deliver({ text: 'response' });
+    });
+
+    await runMonitor({}, {
       historyResponse: { messages: [threadMsg] },
     });
 
-    // sendMessage should be called with threadId from tmid or msg._id
+    // sendMessage should be called with roomId and threadId from tmid
     expect(sendMessage).toHaveBeenCalledWith(
       expect.any(Object),
-      expect.objectContaining({ threadId: 'parent-1' }),
+      expect.objectContaining({ roomId: 'room-1', threadId: 'parent-1' }),
     );
   });
 
   it('respects abortSignal', async () => {
-    const runtime = makeRuntime();
-
     // Abort immediately
     controller.abort();
 
     await monitorRocketChat({
       account: makeAccount(),
       cfg: {},
-      runtime,
       abortSignal: controller.signal,
       log,
     });
 
-    // Should not have polled for history (loop never entered since already aborted,
-    // but getChannelInfo still resolves)
     expect(log.info).toHaveBeenCalledWith(expect.stringContaining('stopped'));
   });
 
   it('caps processed IDs at MAX_PROCESSED_IDS', async () => {
-    const runtime = makeRuntime();
     const msgCount = MAX_PROCESSED_IDS + 100;
     const messages = [];
     for (let i = 0; i < msgCount; i++) {
       messages.push(makeMsg(`msg-${i}`, 'sender-1', 'alice', `msg ${i}`));
     }
 
-    // Return all messages in one poll
-    await runMonitor({}, runtime, {
+    await runMonitor({}, {
       historyResponse: { messages },
     });
 
     // All messages should have been dispatched (they're all new)
-    expect(runtime.channel.dispatchInboundMessage).toHaveBeenCalledTimes(msgCount);
+    expect(mockDispatch).toHaveBeenCalledTimes(msgCount);
   });
 
   it('poll interval is configurable', async () => {
-    const runtime = makeRuntime();
-
-    // Custom interval — just verify it doesn't error
-    await runMonitor({ pollInterval: 0.005 }, runtime, {
+    await runMonitor({ pollInterval: 0.005 }, {
       historyResponse: { messages: [] },
     });
 
-    // No error means it ran with the custom interval
     expect(log.info).toHaveBeenCalledWith(expect.stringContaining('stopped'));
   });
 
   it('resolves channel once at startup', async () => {
-    const runtime = makeRuntime();
-
     let pollCount = 0;
     getChannelHistory.mockImplementation(async () => {
       pollCount++;
@@ -235,20 +249,17 @@ describe('monitor', () => {
     await monitorRocketChat({
       account: makeAccount(),
       cfg: {},
-      runtime,
       abortSignal: controller.signal,
       log,
     });
 
-    // getChannelInfo called exactly once (at startup)
     expect(getChannelInfo).toHaveBeenCalledTimes(1);
   });
 
   it('handles dispatch errors gracefully', async () => {
-    const runtime = makeRuntime();
-    runtime.channel.dispatchInboundMessage.mockRejectedValueOnce(new Error('agent error'));
+    mockDispatch.mockRejectedValueOnce(new Error('agent error'));
 
-    await runMonitor({}, runtime, {
+    await runMonitor({}, {
       historyResponse: { messages: [makeMsg('msg-1')] },
     });
 

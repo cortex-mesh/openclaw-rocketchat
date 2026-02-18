@@ -79,13 +79,13 @@ describe('api', () => {
       const data = { message: { _id: 'msg-2' } };
       globalThis.fetch = mockFetch(data);
 
-      await sendMessage(config, { channel: 'general', text: 'hi', threadId: 'thread-1' });
+      await sendMessage(config, { roomId: 'room-1', text: 'hi', threadId: 'thread-1' });
 
       expect(fetch).toHaveBeenCalledWith(
         'https://chat.example.com/api/v1/chat.postMessage',
         expect.objectContaining({
           method: 'POST',
-          body: JSON.stringify({ channel: 'general', text: 'hi', tmid: 'thread-1' }),
+          body: JSON.stringify({ roomId: 'room-1', text: 'hi', tmid: 'thread-1' }),
         }),
       );
     });
@@ -93,7 +93,7 @@ describe('api', () => {
     it('omits tmid when no threadId', async () => {
       globalThis.fetch = mockFetch({ message: {} });
 
-      await sendMessage(config, { channel: 'general', text: 'hi' });
+      await sendMessage(config, { roomId: 'room-1', text: 'hi' });
 
       const body = JSON.parse(fetch.mock.calls[0][1].body);
       expect(body).not.toHaveProperty('tmid');
