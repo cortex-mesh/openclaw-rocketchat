@@ -5,6 +5,7 @@
 
 import { getChannelInfo, getChannelHistory, sendMessage } from './api.js';
 import { markProcessing, markComplete, markFailed } from './reactions.js';
+import { getRuntime } from './runtime.js';
 
 export const MAX_PROCESSED_IDS = 500;
 
@@ -18,7 +19,7 @@ function sleep(ms, signal) {
   });
 }
 
-export async function monitorRocketChat({ account, cfg, runtime, abortSignal, log }) {
+export async function monitorRocketChat({ account, cfg, abortSignal, log }) {
   const config = {
     url: account.url,
     authToken: account.authToken,
@@ -53,6 +54,9 @@ export async function monitorRocketChat({ account, cfg, runtime, abortSignal, lo
         if (msg.t) continue; // system message
         if (msg.bot) continue;
 
+        // Skip messages already marked as completed (survives restarts)
+        if (msg.reactions?.[':white_check_mark:']) continue;
+
         processedIds.add(msg._id);
 
         // Cap processed IDs set size
@@ -72,36 +76,75 @@ export async function monitorRocketChat({ account, cfg, runtime, abortSignal, lo
         await markProcessing(config, msg._id, log);
 
         try {
-          const route = runtime.channel.routing.resolveAgentRoute({
+          const pluginRuntime = getRuntime();
+          const accountId = account.accountId || 'default';
+
+          const route = pluginRuntime.channel.routing.resolveAgentRoute({
             cfg,
             channel: 'rocketchat',
-            accountId: account.accountId || 'default',
-            peer: { kind: 'user', id: senderId },
+            accountId,
+            peer: { kind: 'group', id: senderId },
           });
 
-          await runtime.channel.dispatchInboundMessage({
-            ctx: {
-              From: senderUsername,
-              To: channelName,
-              Body: text,
-              SessionKey: route.sessionKey,
-            },
+          const sessionKey = route.sessionKey;
+          const from = `rocketchat:${senderId}`;
+          const to = `channel:${channelName}`;
+
+          const ctx = {
+            Body: text,
+            BodyForAgent: text,
+            RawBody: text,
+            CommandBody: text,
+            From: from,
+            To: to,
+            SessionKey: sessionKey,
+            AccountId: accountId,
+            ChatType: 'group',
+            SenderName: senderUsername,
+            SenderId: senderId,
+            SenderUsername: senderUsername,
+            Provider: 'rocketchat',
+            Surface: 'rocketchat',
+            WasMentioned: true,
+            CommandAuthorized: true,
+            CommandSource: 'text',
+            MessageSid: msg._id,
+            Timestamp: new Date(msg.ts).getTime(),
+            OriginatingChannel: 'rocketchat',
+            OriginatingTo: to,
+          };
+
+          let delivered = false;
+          let deliveryError = null;
+
+          await pluginRuntime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+            ctx,
             cfg,
-            dispatcher: runtime.channel.createReplyDispatcher({
+            replyOptions: {},
+            dispatcherOptions: {
               deliver: async (payload) => {
                 await sendMessage(config, {
-                  channel: channelName,
+                  roomId,
                   text: payload.text,
                   threadId: threadId || msg._id,
                 });
-                await markComplete(config, msg._id, log);
+                delivered = true;
               },
-              onError: async (err) => {
-                await markFailed(config, msg._id, log);
-                log?.error?.(`Failed to process message ${msg._id}: ${err.message}`);
+              onError: (err) => {
+                deliveryError = err;
+                log?.error?.(`Reply delivery failed for ${msg._id}: ${err.message}`);
               },
-            }),
+            },
           });
+
+          if (delivered && !deliveryError) {
+            await markComplete(config, msg._id, log);
+          } else {
+            await markFailed(config, msg._id, log);
+            if (!deliveryError) {
+              log?.warn?.(`No reply delivered for message ${msg._id}`);
+            }
+          }
         } catch (err) {
           await markFailed(config, msg._id, log);
           log?.error?.(`Dispatch error for message ${msg._id}: ${err.message}`);

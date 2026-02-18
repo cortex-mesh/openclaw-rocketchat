@@ -2,7 +2,7 @@
  * Rocket.Chat ChannelPlugin definition for OpenClaw.
  */
 
-import { sendMessage, probe } from './api.js';
+import { sendMessage, getChannelInfo, probe } from './api.js';
 import { monitorRocketChat } from './monitor.js';
 
 export const rocketchatPlugin = {
@@ -21,26 +21,39 @@ export const rocketchatPlugin = {
   },
 
   config: {
-    listAccounts(cfg) {
+    listAccountIds(cfg) {
       const rc = cfg?.channels?.rocketchat;
       if (!rc) return [];
-      // Support single-account shorthand (url directly on the object)
-      if (rc.url) {
-        return [{ accountId: 'default', ...rc }];
-      }
-      // Support multi-account (accounts sub-object)
-      if (rc.accounts) {
-        return Object.entries(rc.accounts).map(([id, acct]) => ({
-          accountId: id,
-          ...acct,
-        }));
-      }
+      // Single-account shorthand (url directly on the object)
+      if (rc.url) return ['default'];
+      // Multi-account (accounts sub-object)
+      if (rc.accounts) return Object.keys(rc.accounts);
       return [];
     },
 
     resolveAccount(cfg, accountId) {
-      const accounts = rocketchatPlugin.config.listAccounts(cfg);
-      return accounts.find((a) => a.accountId === accountId) || null;
+      const rc = cfg?.channels?.rocketchat;
+      if (!rc) return null;
+      // Single-account shorthand
+      if (rc.url) {
+        return accountId === 'default' ? { accountId: 'default', ...rc } : null;
+      }
+      // Multi-account
+      const acct = rc.accounts?.[accountId];
+      return acct ? { accountId, ...acct } : null;
+    },
+
+    isConfigured(account) {
+      return !!(account?.url && account?.authToken && account?.userId);
+    },
+
+    describeAccount(account) {
+      return {
+        accountId: account?.accountId ?? 'default',
+        name: account?.channel ?? 'Rocket.Chat',
+        enabled: account?.enabled !== false,
+        configured: !!(account?.url && account?.authToken && account?.userId),
+      };
     },
   },
 
@@ -54,7 +67,6 @@ export const rocketchatPlugin = {
       monitorRocketChat({
         account,
         cfg: ctx.cfg,
-        runtime: ctx.runtime,
         abortSignal: ctx.abortSignal,
         log: ctx.log,
       });
@@ -71,8 +83,9 @@ export const rocketchatPlugin = {
         authToken: ctx.account.authToken,
         userId: ctx.account.userId,
       };
+      const info = await getChannelInfo(config, ctx.account.channel);
       await sendMessage(config, {
-        channel: ctx.account.channel,
+        roomId: info.channel._id,
         text: ctx.text,
         threadId: ctx.threadId || null,
       });

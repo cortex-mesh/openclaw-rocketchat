@@ -37,8 +37,8 @@ export async function getChannelHistory(config, roomId, count = 20) {
   return request(config, 'GET', `/api/v1/channels.history?roomId=${encodeURIComponent(roomId)}&count=${count}`);
 }
 
-export async function sendMessage(config, { channel, text, threadId }) {
-  const body = { channel, text };
+export async function sendMessage(config, { roomId, text, threadId }) {
+  const body = { roomId, text };
   if (threadId) body.tmid = threadId;
   return request(config, 'POST', '/api/v1/chat.postMessage', body);
 }
