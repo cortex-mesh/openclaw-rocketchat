@@ -37,6 +37,11 @@ export async function getChannelHistory(config, roomId, count = 20) {
   return request(config, 'GET', `/api/v1/channels.history?roomId=${encodeURIComponent(roomId)}&count=${count}`);
 }
 
+export async function getThreadMessages(config, threadId, { count = 50, offset = 0 } = {}) {
+  return request(config, 'GET',
+    `/api/v1/chat.getThreadMessages?tmid=${encodeURIComponent(threadId)}&count=${count}&offset=${offset}`);
+}
+
 export async function sendMessage(config, { roomId, text, threadId }) {
   const body = { roomId, text };
   if (threadId) body.tmid = threadId;

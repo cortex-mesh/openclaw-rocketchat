@@ -16,6 +16,7 @@ import { monitorRocketChat } from '../src/monitor.js';
 vi.mock('../src/api.js', () => ({
   getChannelInfo: vi.fn(),
   getChannelHistory: vi.fn(),
+  getThreadMessages: vi.fn().mockResolvedValue({ messages: [] }),
   sendMessage: vi.fn().mockResolvedValue({}),
   reactToMessage: vi.fn().mockResolvedValue({}),
 }));
@@ -33,7 +34,7 @@ vi.mock('../src/runtime.js', () => ({
   setRuntime: vi.fn(),
 }));
 
-import { getChannelInfo, getChannelHistory, sendMessage, reactToMessage } from '../src/api.js';
+import { getChannelInfo, getChannelHistory, getThreadMessages, sendMessage, reactToMessage } from '../src/api.js';
 
 function makeMsg(id, userId = 'sender-1', username = 'alice', text = 'hello', extra = {}) {
   return { _id: id, msg: text, u: { _id: userId, username }, ts: '2026-02-17T00:00:00Z', ...extra };
@@ -290,5 +291,51 @@ describe('workflow: multiple messages in one poll', () => {
 
     // Only one sendMessage call (for msg-a)
     expect(sendMessage).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('workflow: thread-only reply — hourglass → deliver → checkmark', () => {
+  it('processes a thread-only reply with full reaction lifecycle', async () => {
+    // Parent message with a thread (already processed, has checkmark)
+    const parentMsg = {
+      ...makeMsg('parent-1', 'sender-1', 'alice', 'start thread'),
+      tcount: 1,
+      reactions: { ':white_check_mark:': { usernames: ['bot'] } },
+    };
+
+    // Thread-only reply (not in channel history, only in thread poll)
+    const threadReply = makeMsg('reply-1', 'sender-2', 'bob', 'thread question', { tmid: 'parent-1' });
+
+    getThreadMessages.mockResolvedValueOnce({ messages: [threadReply] });
+
+    // Agent responds to the thread reply
+    mockDispatch.mockImplementationOnce(async ({ dispatcherOptions }) => {
+      await dispatcherOptions.deliver({ text: 'Thread answer!' });
+    });
+
+    await runMonitor({}, {
+      historyResponse: { messages: [parentMsg] },
+    });
+
+    const reactions = reactionCalls();
+
+    // Parent skipped (has checkmark), only thread reply processed
+    // 1. Hourglass added to thread reply
+    expect(reactions[0]).toEqual(['reply-1', 'hourglass', true]);
+
+    // 2. Response sent in the parent thread
+    expect(sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ url: 'https://chat.example.com' }),
+      { roomId: 'room-1', text: 'Thread answer!', threadId: 'parent-1' },
+    );
+
+    // 3. Hourglass removed from thread reply
+    expect(reactions[1]).toEqual(['reply-1', 'hourglass', false]);
+
+    // 4. Checkmark added to thread reply
+    expect(reactions[2]).toEqual(['reply-1', 'white_check_mark', true]);
+
+    expect(reactions).toHaveLength(3);
+    expect(mockDispatch).toHaveBeenCalledTimes(1);
   });
 });

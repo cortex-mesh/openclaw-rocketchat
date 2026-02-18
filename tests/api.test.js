@@ -3,6 +3,7 @@ import {
   getMe,
   getChannelInfo,
   getChannelHistory,
+  getThreadMessages,
   sendMessage,
   reactToMessage,
   probe,
@@ -69,6 +70,32 @@ describe('api', () => {
       expect(result).toEqual(data);
       expect(fetch).toHaveBeenCalledWith(
         'https://chat.example.com/api/v1/channels.history?roomId=room-1&count=10',
+        expect.any(Object),
+      );
+    });
+  });
+
+  describe('getThreadMessages', () => {
+    it('returns thread messages with count and offset', async () => {
+      const data = { messages: [{ _id: 'reply-1', msg: 'thread reply' }] };
+      globalThis.fetch = mockFetch(data);
+
+      const result = await getThreadMessages(config, 'parent-1', { count: 30, offset: 5 });
+
+      expect(result).toEqual(data);
+      expect(fetch).toHaveBeenCalledWith(
+        'https://chat.example.com/api/v1/chat.getThreadMessages?tmid=parent-1&count=30&offset=5',
+        expect.any(Object),
+      );
+    });
+
+    it('uses default count of 50 and offset of 0', async () => {
+      globalThis.fetch = mockFetch({ messages: [] });
+
+      await getThreadMessages(config, 'parent-1');
+
+      expect(fetch).toHaveBeenCalledWith(
+        'https://chat.example.com/api/v1/chat.getThreadMessages?tmid=parent-1&count=50&offset=0',
         expect.any(Object),
       );
     });

@@ -5,6 +5,7 @@ import { monitorRocketChat, MAX_PROCESSED_IDS } from '../src/monitor.js';
 vi.mock('../src/api.js', () => ({
   getChannelInfo: vi.fn(),
   getChannelHistory: vi.fn(),
+  getThreadMessages: vi.fn().mockResolvedValue({ messages: [] }),
   sendMessage: vi.fn().mockResolvedValue({}),
   reactToMessage: vi.fn().mockResolvedValue({}),
 }));
@@ -27,7 +28,7 @@ vi.mock('../src/runtime.js', () => ({
   setRuntime: vi.fn(),
 }));
 
-import { getChannelInfo, getChannelHistory, sendMessage, reactToMessage } from '../src/api.js';
+import { getChannelInfo, getChannelHistory, getThreadMessages, sendMessage, reactToMessage } from '../src/api.js';
 
 function makeMsg(id, userId = 'sender-1', username = 'alice', text = 'hello', extra = {}) {
   return { _id: id, msg: text, u: { _id: userId, username }, ...extra };
@@ -271,5 +272,110 @@ describe('monitor', () => {
       true,
     );
     expect(log.error).toHaveBeenCalledWith(expect.stringContaining('msg-1'));
+  });
+
+  describe('thread polling', () => {
+    it('discovers threads from tcount > 0 in history and polls them', async () => {
+      const parentMsg = makeMsg('parent-1', 'sender-1', 'alice', 'start thread', { tcount: 2 });
+      const threadReply = makeMsg('reply-1', 'sender-2', 'bob', 'thread reply');
+
+      getThreadMessages.mockResolvedValueOnce({ messages: [threadReply] });
+
+      await runMonitor({}, {
+        historyResponse: { messages: [parentMsg] },
+      });
+
+      // Thread was polled with offset 0 (first poll)
+      expect(getThreadMessages).toHaveBeenCalledWith(
+        expect.objectContaining({ url: 'https://chat.example.com' }),
+        'parent-1',
+        { count: 50, offset: 0 },
+      );
+
+      // Both parent and thread reply dispatched
+      expect(mockDispatch).toHaveBeenCalledTimes(2);
+    });
+
+    it('dispatches thread-only replies with correct threadId', async () => {
+      const parentMsg = makeMsg('parent-1', 'sender-1', 'alice', 'start', { tcount: 1 });
+      const threadReply = makeMsg('reply-1', 'sender-2', 'bob', 'in-thread');
+
+      getThreadMessages.mockResolvedValueOnce({ messages: [threadReply] });
+
+      mockDispatch.mockImplementation(async ({ ctx, dispatcherOptions }) => {
+        if (ctx.MessageSid === 'reply-1') {
+          await dispatcherOptions.deliver({ text: 'response' });
+        }
+      });
+
+      await runMonitor({}, {
+        historyResponse: { messages: [parentMsg] },
+      });
+
+      // Reply should be sent to the parent thread
+      expect(sendMessage).toHaveBeenCalledWith(
+        expect.any(Object),
+        expect.objectContaining({ roomId: 'room-1', threadId: 'parent-1' }),
+      );
+    });
+
+    it('skips already-processed thread replies', async () => {
+      const parentMsg = makeMsg('parent-1', 'sender-1', 'alice', 'start', { tcount: 1 });
+      // The parent also appears in thread messages (RC includes it)
+      const threadParent = makeMsg('parent-1', 'sender-1', 'alice', 'start');
+
+      getThreadMessages.mockResolvedValueOnce({ messages: [threadParent] });
+
+      await runMonitor({}, {
+        historyResponse: { messages: [parentMsg] },
+      });
+
+      // Only dispatched once (parent from history), not again from thread poll
+      expect(mockDispatch).toHaveBeenCalledTimes(1);
+    });
+
+    it('skips thread replies with checkmark', async () => {
+      const parentMsg = makeMsg('parent-1', 'sender-1', 'alice', 'start', { tcount: 1 });
+      const completedReply = {
+        ...makeMsg('reply-1', 'sender-2', 'bob', 'done'),
+        reactions: { ':white_check_mark:': { usernames: ['bot'] } },
+      };
+
+      getThreadMessages.mockResolvedValueOnce({ messages: [completedReply] });
+
+      await runMonitor({}, {
+        historyResponse: { messages: [parentMsg] },
+      });
+
+      // Only parent dispatched, completed reply skipped
+      expect(mockDispatch).toHaveBeenCalledTimes(1);
+    });
+
+    it('handles thread poll errors gracefully', async () => {
+      const parentMsg = makeMsg('parent-1', 'sender-1', 'alice', 'start', { tcount: 1 });
+
+      getThreadMessages.mockRejectedValueOnce(new Error('RC API 500'));
+
+      await runMonitor({}, {
+        historyResponse: { messages: [parentMsg] },
+      });
+
+      // Parent still dispatched
+      expect(mockDispatch).toHaveBeenCalledTimes(1);
+
+      // Error logged but monitor did not crash
+      expect(log.error).toHaveBeenCalledWith(expect.stringContaining('Thread poll error'));
+      expect(log.info).toHaveBeenCalledWith(expect.stringContaining('stopped'));
+    });
+
+    it('does not poll threads without tcount > 0', async () => {
+      const regularMsg = makeMsg('msg-1', 'sender-1', 'alice', 'no thread');
+
+      await runMonitor({}, {
+        historyResponse: { messages: [regularMsg] },
+      });
+
+      expect(getThreadMessages).not.toHaveBeenCalled();
+    });
   });
 });
