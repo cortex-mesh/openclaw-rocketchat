@@ -295,7 +295,7 @@ describe('workflow: multiple messages in one poll', () => {
 });
 
 describe('workflow: thread-only reply — hourglass → deliver → checkmark', () => {
-  it('processes a thread-only reply with full reaction lifecycle', async () => {
+  it('processes a thread-only reply with full reaction lifecycle and thread context', async () => {
     // Parent message with a thread (already processed, has checkmark)
     const parentMsg = {
       ...makeMsg('parent-1', 'sender-1', 'alice', 'start thread'),
@@ -306,10 +306,21 @@ describe('workflow: thread-only reply — hourglass → deliver → checkmark', 
     // Thread-only reply (not in channel history, only in thread poll)
     const threadReply = makeMsg('reply-1', 'sender-2', 'bob', 'thread question', { tmid: 'parent-1' });
 
-    getThreadMessages.mockResolvedValueOnce({ messages: [threadReply] });
+    // Full thread history for context
+    const threadHistory = [
+      makeMsg('parent-1', 'sender-1', 'alice', 'start thread'),
+      makeMsg('bot-resp-1', 'bot-user', 'bot', 'bot response'),
+      makeMsg('reply-1', 'sender-2', 'bob', 'thread question'),
+    ];
+
+    // First call: offset-based poll returns the new reply
+    // Second call: context fetch returns full thread history
+    getThreadMessages
+      .mockResolvedValueOnce({ messages: [threadReply], total: 3 })
+      .mockResolvedValueOnce({ messages: threadHistory });
 
     // Agent responds to the thread reply
-    mockDispatch.mockImplementationOnce(async ({ dispatcherOptions }) => {
+    mockDispatch.mockImplementationOnce(async ({ ctx, dispatcherOptions }) => {
       await dispatcherOptions.deliver({ text: 'Thread answer!' });
     });
 
@@ -337,5 +348,12 @@ describe('workflow: thread-only reply — hourglass → deliver → checkmark', 
 
     expect(reactions).toHaveLength(3);
     expect(mockDispatch).toHaveBeenCalledTimes(1);
+
+    // Verify thread context was populated
+    const ctx = mockDispatch.mock.calls[0][0].ctx;
+    expect(ctx.InboundHistory).toBeDefined();
+    expect(ctx.InboundHistory.length).toBeGreaterThan(0);
+    expect(ctx.ThreadStarterBody).toBe('start thread');
+    expect(ctx.MessageThreadId).toBe('parent-1');
   });
 });

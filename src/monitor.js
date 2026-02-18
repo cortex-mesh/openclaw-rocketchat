@@ -9,6 +9,37 @@ import { getRuntime } from './runtime.js';
 
 export const MAX_PROCESSED_IDS = 500;
 const DEFAULT_THREAD_TTL_HOURS = 24;
+const DEFAULT_THREAD_CONTEXT_BUDGET = 16000;
+
+/**
+ * Build InboundHistory from thread messages, applying a character budget.
+ * Walks newest-first so the most recent (most relevant) messages get priority.
+ */
+export function buildInboundHistory(threadHistory, currentMsgId, budget) {
+  const prior = threadHistory
+    .filter(m => m._id !== currentMsgId)
+    .reverse(); // newest-first for budget allocation
+
+  const entries = [];
+  let remaining = budget;
+
+  for (const m of prior) {
+    if (remaining <= 0) break;
+    const sender = m.u?.username || 'unknown';
+    const body = m.msg || '';
+    const timestamp = new Date(m.ts).getTime();
+
+    if (body.length <= remaining) {
+      entries.push({ sender, body, timestamp });
+      remaining -= body.length;
+    } else {
+      entries.push({ sender, body: body.slice(0, remaining) + '\u2026', timestamp });
+      remaining = 0;
+    }
+  }
+
+  return entries.reverse(); // back to chronological order
+}
 
 function sleep(ms, signal) {
   return new Promise((resolve) => {
@@ -20,7 +51,7 @@ function sleep(ms, signal) {
   });
 }
 
-async function processMessage(config, msg, roomId, replyThreadId, { account, cfg, botUserId, channelName, log, processedIds }) {
+async function processMessage(config, msg, roomId, replyThreadId, { account, cfg, botUserId, channelName, log, processedIds, threadHistory }) {
   // Skip filters
   if (msg.u?._id === botUserId) return false;
   if (msg.t) return false; // system message
@@ -83,6 +114,13 @@ async function processMessage(config, msg, roomId, replyThreadId, { account, cfg
       OriginatingChannel: 'rocketchat',
       OriginatingTo: to,
     };
+
+    if (threadHistory?.length) {
+      const budget = account.threadContextBudget ?? DEFAULT_THREAD_CONTEXT_BUDGET;
+      ctx.InboundHistory = buildInboundHistory(threadHistory, msg._id, budget);
+      ctx.ThreadStarterBody = threadHistory[0]?.msg || '';
+      ctx.MessageThreadId = replyThreadId;
+    }
 
     let delivered = false;
     let deliveryError = null;
@@ -168,8 +206,20 @@ export async function monitorRocketChat({ account, cfg, abortSignal, log }) {
         }
 
         const replyThreadId = msg.tmid || msg._id;
+
+        // Fetch thread context for messages that are thread replies
+        let threadHistory;
+        if (msg.tmid) {
+          try {
+            const threadData = await getThreadMessages(config, msg.tmid, { count: 20 });
+            threadHistory = threadData.messages || [];
+          } catch (err) {
+            log?.error?.(`Thread context fetch error for ${msg.tmid}: ${err.message}`);
+          }
+        }
+
         await processMessage(config, msg, roomId, replyThreadId, {
-          account, cfg, botUserId, channelName, log, processedIds,
+          account, cfg, botUserId, channelName, log, processedIds, threadHistory,
         });
       }
 
@@ -189,17 +239,26 @@ export async function monitorRocketChat({ account, cfg, abortSignal, log }) {
             count: 50,
             offset: state.offset,
           });
-          const replies = threadData.messages || [];
+          const newReplies = threadData.messages || [];
 
-          for (const reply of replies) {
-            if (abortSignal?.aborted) break;
-            await processMessage(config, reply, roomId, threadId, {
-              account, cfg, botUserId, channelName, log, processedIds,
+          if (newReplies.length > 0) {
+            // Fetch last N messages for context (one extra API call per active thread with new activity)
+            const total = threadData.total ?? (state.offset + newReplies.length);
+            const contextCount = 20;
+            const contextOffset = Math.max(0, total - contextCount);
+            const contextData = await getThreadMessages(config, threadId, {
+              count: contextCount, offset: contextOffset,
             });
-          }
+            const threadHistory = contextData.messages || [];
 
-          if (replies.length > 0) {
-            state.offset += replies.length;
+            for (const reply of newReplies) {
+              if (abortSignal?.aborted) break;
+              await processMessage(config, reply, roomId, threadId, {
+                account, cfg, botUserId, channelName, log, processedIds, threadHistory,
+              });
+            }
+
+            state.offset += newReplies.length;
             state.lastSeen = Date.now();
           }
         } catch (err) {
