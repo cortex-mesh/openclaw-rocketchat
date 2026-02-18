@@ -19,6 +19,7 @@ vi.mock('../src/api.js', () => ({
   getThreadMessages: vi.fn().mockResolvedValue({ messages: [] }),
   sendMessage: vi.fn().mockResolvedValue({}),
   reactToMessage: vi.fn().mockResolvedValue({}),
+  downloadFile: vi.fn().mockResolvedValue(undefined),
 }));
 
 const mockDispatch = vi.fn().mockResolvedValue({});
@@ -34,7 +35,7 @@ vi.mock('../src/runtime.js', () => ({
   setRuntime: vi.fn(),
 }));
 
-import { getChannelInfo, getChannelHistory, getThreadMessages, sendMessage, reactToMessage } from '../src/api.js';
+import { getChannelInfo, getChannelHistory, getThreadMessages, sendMessage, reactToMessage, downloadFile } from '../src/api.js';
 
 function makeMsg(id, userId = 'sender-1', username = 'alice', text = 'hello', extra = {}) {
   return { _id: id, msg: text, u: { _id: userId, username }, ts: '2026-02-17T00:00:00Z', ...extra };
@@ -103,7 +104,7 @@ describe('workflow: happy path — message processed and response delivered', ()
 
     const reactions = reactionCalls();
 
-    // 1. Hourglass added on receipt
+    // 1. Hourglass added on receipt (no ❌ removal — message has no prior failure)
     expect(reactions[0]).toEqual(['msg-1', 'hourglass', true]);
 
     // 2. Response sent via sendMessage to the correct room and thread
@@ -355,5 +356,121 @@ describe('workflow: thread-only reply — hourglass → deliver → checkmark', 
     expect(ctx.InboundHistory.length).toBeGreaterThan(0);
     expect(ctx.ThreadStarterBody).toBe('start thread');
     expect(ctx.MessageThreadId).toBe('parent-1');
+  });
+});
+
+describe('workflow: retry after failure — stale ❌ cleared before processing', () => {
+  it('removes ❌ when message has a prior failure reaction', async () => {
+    mockDispatch.mockImplementationOnce(async ({ dispatcherOptions }) => {
+      await dispatcherOptions.deliver({ text: 'Success on retry!' });
+    });
+
+    // Message that previously failed (has ❌ reaction from prior attempt)
+    const retriedMsg = makeMsg('msg-retry-1', 'sender-1', 'alice', 'try again', {
+      reactions: { ':x:': { usernames: ['bot'] } },
+    });
+
+    await runMonitor({}, {
+      historyResponse: { messages: [retriedMsg] },
+    });
+
+    const reactions = reactionCalls();
+
+    // 1. ❌ removed (stale failure cleared because msg.reactions has :x:)
+    expect(reactions[0]).toEqual(['msg-retry-1', 'x', false]);
+
+    // 2. Hourglass added
+    expect(reactions[1]).toEqual(['msg-retry-1', 'hourglass', true]);
+
+    // 3. Hourglass removed
+    expect(reactions[2]).toEqual(['msg-retry-1', 'hourglass', false]);
+
+    // 4. Checkmark added
+    expect(reactions[3]).toEqual(['msg-retry-1', 'white_check_mark', true]);
+
+    expect(reactions).toHaveLength(4);
+  });
+});
+
+describe('workflow: file attachment — MediaPath/MediaType populated', () => {
+  it('populates MediaPath and MediaType for a single file upload', async () => {
+    mockDispatch.mockImplementationOnce(async ({ ctx, dispatcherOptions }) => {
+      await dispatcherOptions.deliver({ text: 'Got it!' });
+    });
+
+    const fileMsg = makeMsg('msg-file-1', 'sender-1', 'alice', 'here is a file', {
+      file: { _id: 'file-abc', name: 'report.pdf', type: 'application/pdf' },
+      attachments: [{ type: 'file', title: 'report.pdf', title_link: '/file-upload/file-abc/report.pdf' }],
+    });
+
+    await runMonitor({}, {
+      historyResponse: { messages: [fileMsg] },
+    });
+
+    // downloadFile should have been called
+    expect(downloadFile).toHaveBeenCalledWith(
+      expect.objectContaining({ url: 'https://chat.example.com' }),
+      '/file-upload/file-abc/report.pdf',
+      expect.stringContaining('report.pdf'),
+    );
+
+    // Verify context has MediaPath and MediaType
+    const ctx = mockDispatch.mock.calls[0][0].ctx;
+    expect(ctx.MediaPath).toEqual(expect.stringContaining('report.pdf'));
+    expect(ctx.MediaType).toBe('application/pdf');
+    expect(ctx.MediaPaths).toBeUndefined();
+  });
+
+  it('skips attachments without msg.file (URL previews/unfurls)', async () => {
+    mockDispatch.mockImplementationOnce(async ({ dispatcherOptions }) => {
+      await dispatcherOptions.deliver({ text: 'response' });
+    });
+
+    // URL unfurl — has attachments but no msg.file
+    const unfurlMsg = makeMsg('msg-unfurl-1', 'sender-1', 'alice', 'https://example.com', {
+      attachments: [{ type: 'image', image_url: 'https://example.com/preview.png' }],
+    });
+
+    await runMonitor({}, {
+      historyResponse: { messages: [unfurlMsg] },
+    });
+
+    expect(downloadFile).not.toHaveBeenCalled();
+
+    const ctx = mockDispatch.mock.calls[0][0].ctx;
+    expect(ctx.MediaPath).toBeUndefined();
+    expect(ctx.MediaPaths).toBeUndefined();
+  });
+
+  it('logs warning and continues when download fails', async () => {
+    downloadFile.mockRejectedValueOnce(new Error('404 Not Found'));
+
+    mockDispatch.mockImplementationOnce(async ({ dispatcherOptions }) => {
+      await dispatcherOptions.deliver({ text: 'Got it anyway!' });
+    });
+
+    const fileMsg = makeMsg('msg-file-fail', 'sender-1', 'alice', 'broken file', {
+      file: { _id: 'file-xyz', name: 'missing.pdf', type: 'application/pdf' },
+      attachments: [{ type: 'file', title: 'missing.pdf', title_link: '/file-upload/file-xyz/missing.pdf' }],
+    });
+
+    await runMonitor({}, {
+      historyResponse: { messages: [fileMsg] },
+    });
+
+    // Download was attempted
+    expect(downloadFile).toHaveBeenCalled();
+
+    // Warning logged about failure
+    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('Attachment download failed'));
+
+    // Message still processed as text-only (no media context)
+    const ctx = mockDispatch.mock.calls[0][0].ctx;
+    expect(ctx.MediaPath).toBeUndefined();
+    expect(ctx.Body).toBe('broken file');
+
+    // Still marked complete
+    const reactions = reactionCalls();
+    expect(reactions[reactions.length - 1]).toEqual(['msg-file-fail', 'white_check_mark', true]);
   });
 });

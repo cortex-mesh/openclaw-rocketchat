@@ -56,6 +56,23 @@ export async function reactToMessage(config, messageId, emoji, shouldReact) {
   });
 }
 
+export async function downloadFile(config, fileUrl, destPath) {
+  const { writeFile } = await import('node:fs/promises');
+  const url = `${config.url}${fileUrl}`;
+  const res = await fetch(url, {
+    headers: {
+      'X-Auth-Token': config.authToken,
+      'X-User-Id': config.userId,
+    },
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => res.statusText);
+    throw new Error(`File download GET ${fileUrl} failed (${res.status}): ${text}`);
+  }
+  const buffer = Buffer.from(await res.arrayBuffer());
+  await writeFile(destPath, buffer);
+}
+
 export async function probe(config) {
   try {
     const data = await getMe(config);
