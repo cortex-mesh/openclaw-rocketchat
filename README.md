@@ -11,9 +11,7 @@ A Rocket.Chat channel plugin for [OpenClaw](https://github.com/nichochar/open-cl
 ## Installation
 
 ```bash
-git clone https://github.com/cortex-mesh/openclaw-rocketchat.git
-cd openclaw-rocketchat
-npm install
+npm install @cortex-mesh/openclaw-rocketchat
 ```
 
 ## Configuration
