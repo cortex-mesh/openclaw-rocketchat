@@ -1,0 +1,83 @@
+name: Auto Version
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  version:
+    name: Bump Version
+    runs-on: ubuntu-latest
+    # Skip if this is a version bump commit (avoid infinite loop)
+    if: "!startsWith(github.event.head_commit.message, 'chore(version):')"
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Determine version bump
+        id: bump
+        env:
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+        run: |
+          # Get first line of commit message only
+          FIRST_LINE=$(echo "$COMMIT_MSG" | head -n1)
+          echo "Commit first line: $FIRST_LINE"
+
+          # For merge commits ("Merge pull request #N from ..."), extract the
+          # PR title from the commit body (line 3) as a fallback.
+          CHECK_LINE="$FIRST_LINE"
+          if echo "$FIRST_LINE" | grep -qE '^Merge pull request #[0-9]+'; then
+            PR_TITLE=$(echo "$COMMIT_MSG" | sed -n '3p')
+            if [ -n "$PR_TITLE" ]; then
+              echo "Merge commit detected, using PR title: $PR_TITLE"
+              CHECK_LINE="$PR_TITLE"
+            fi
+          fi
+
+          # Determine bump type based on conventional commit prefix
+          case "$CHECK_LINE" in
+            feat!:*|feat\(*\)!:*)
+              echo "bump=major" >> $GITHUB_OUTPUT
+              ;;
+            *"BREAKING CHANGE"*)
+              echo "bump=major" >> $GITHUB_OUTPUT
+              ;;
+            feat:*|feat\(*\):*)
+              echo "bump=minor" >> $GITHUB_OUTPUT
+              ;;
+            fix:*|fix\(*\):*)
+              echo "bump=patch" >> $GITHUB_OUTPUT
+              ;;
+            *)
+              # docs:, chore:, test:, refactor:, ci:, style: = no bump
+              echo "bump=none" >> $GITHUB_OUTPUT
+              ;;
+          esac
+
+      - name: Bump version
+        if: steps.bump.outputs.bump != 'none'
+        id: version
+        run: |
+          NEW=$(npm version ${{ steps.bump.outputs.bump }} --no-git-tag-version)
+          # npm version outputs "vX.Y.Z", strip the leading "v"
+          NEW="${NEW#v}"
+          echo "New version: $NEW"
+          echo "new=$NEW" >> $GITHUB_OUTPUT
+
+      - name: Commit version bump
+        if: steps.bump.outputs.bump != 'none'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add package.json package-lock.json
+          git commit -m "chore(version): bump to ${{ steps.version.outputs.new }}"
+          git push
